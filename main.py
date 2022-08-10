@@ -4,15 +4,15 @@ import json
 import logging
 import os
 import ssl
+import traceback
 import uuid
 
 import cv2
 from aiohttp import web
-from av import VideoFrame
 import mediapipe as mp
 
-from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
-from aiortc.contrib.media import MediaBlackhole, MediaRecorder, MediaRelay
+from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.contrib.media import MediaRelay
 
 ROOT = os.path.dirname(__file__)
 
@@ -41,43 +41,46 @@ def detect_img(image):
     return results
 
 
-def draw_mesh(image, results):
-    if results.multi_face_landmarks:
-        for face_landmarks in results.multi_face_landmarks:
-            mp_drawing.draw_landmarks(
-                image=image,
-                landmark_list=face_landmarks,
-                connections=mp_face_mesh.FACEMESH_FACE_OVAL,
-                landmark_drawing_spec=drawing_spec,
-                connection_drawing_spec=drawing_spec)
-    return image
+class FaceLivelinessProcessor:
+    def __init__(self):
+        self.__tracks = {}
+        self.channel = None
 
+    def addTrack(self, track):
+        if track not in self.__tracks:
+            self.__tracks[track] = None
 
-class VideoTransformTrack(MediaStreamTrack):
-    """
-    A video stream track that transforms frames from an another track.
-    """
+    async def start(self):
+        for track, task in self.__tracks.items():
+            if task is None:
+                self.__tracks[track] = asyncio.ensure_future(self.consume(track))
 
-    kind = "video"
+    async def stop(self):
+        for task in self.__tracks.values():
+            if task is not None:
+                task.cancel()
+        self.__tracks = {}
 
-    def __init__(self, track):
-        super().__init__()
-        self.track = track
+    async def consume(self, track):
+        while True:
+            try:
+                frame = await track.recv()
+                img = frame.to_ndarray(format="bgr24")
 
-    async def recv(self):
-        frame = await self.track.recv()
+                results = detect_img(img)
 
-        # perform edge detection
-        img = frame.to_ndarray(format="bgr24")
+                if self.channel is not None:
+                    mess = {
+                        "num_face": len(results.multi_face_landmarks) if results.multi_face_landmarks else 0,
+                    }
+                    print(mess)
+                    self.channel.send(json.dumps(mess))
+                    await self.channel._RTCDataChannel__transport._data_channel_flush()
+                    await self.channel._RTCDataChannel__transport._transmit()
 
-        results = detect_img(img)
-        draw_img = draw_mesh(img.copy(), results)
-
-        # rebuild a VideoFrame, preserving timing information
-        new_frame = VideoFrame.from_ndarray(draw_img, format="bgr24")
-        new_frame.pts = frame.pts
-        new_frame.time_base = frame.time_base
-        return new_frame
+            except Exception as e:
+                traceback.print_exc()
+                return
 
 
 async def index(request):
@@ -104,17 +107,29 @@ async def offer(request):
     log_info("Created for %s", request.remote)
 
     # prepare local media
-    if args.record_to:
-        recorder = MediaRecorder(args.record_to)
-    else:
-        recorder = MediaBlackhole()
+    processor = FaceLivelinessProcessor()
 
     @pc.on("datachannel")
     def on_datachannel(channel):
+        processor.channel = channel
+        log_info("Mount data channel")
+
         @channel.on("message")
         def on_message(message):
             if isinstance(message, str) and message.startswith("ping"):
                 channel.send("pong" + message[4:])
+
+    @pc.on("track")
+    def on_track(track):
+        log_info("Track %s received", track.kind)
+
+        if track.kind == "video":
+            processor.addTrack(relay.subscribe(track))
+
+        @track.on("ended")
+        async def on_ended():
+            log_info("Track %s ended", track.kind)
+            await processor.stop()
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
@@ -123,25 +138,9 @@ async def offer(request):
             await pc.close()
             pcs.discard(pc)
 
-    @pc.on("track")
-    def on_track(track):
-        log_info("Track %s received", track.kind)
-
-        if track.kind == "video":
-            pc.addTrack(
-                VideoTransformTrack(relay.subscribe(track))
-            )
-            if args.record_to:
-                recorder.addTrack(relay.subscribe(track))
-
-        @track.on("ended")
-        async def on_ended():
-            log_info("Track %s ended", track.kind)
-            await recorder.stop()
-
     # handle offer
     await pc.setRemoteDescription(offer)
-    await recorder.start()
+    await processor.start()
 
     # send answer
     answer = await pc.createAnswer()
