@@ -15,10 +15,6 @@ function createPeerConnection() {
         sdpSemantics: 'unified-plan'
     };
 
-    if (document.getElementById('use-stun').checked) {
-        config.iceServers = [{urls: ['stun:stun.l.google.com:19302']}];
-    }
-
     pc = new RTCPeerConnection(config);
 
     // register some listeners to help debugging
@@ -36,11 +32,6 @@ function createPeerConnection() {
         signalingLog.textContent += ' -> ' + pc.signalingState;
     }, false);
     signalingLog.textContent = pc.signalingState;
-
-//    // connect audio / video
-//    pc.addEventListener('track', function(evt) {
-//        document.getElementById('video').srcObject = evt.streams[0];
-//    });
 
     return pc;
 }
@@ -65,14 +56,7 @@ function negotiate() {
         });
     }).then(function() {
         var offer = pc.localDescription;
-        var codec;
-
-        codec = document.getElementById('video-codec').value;
-        if (codec !== 'default') {
-            offer.sdp = sdpFilterCodec('video', codec, offer.sdp);
-        }
-
-        document.getElementById('offer-sdp').textContent = offer.sdp;
+        console.log(offer.sdp);
         return fetch('/offer', {
             body: JSON.stringify({
                 sdp: offer.sdp,
@@ -86,7 +70,7 @@ function negotiate() {
     }).then(function(response) {
         return response.json();
     }).then(function(answer) {
-        document.getElementById('answer-sdp').textContent = answer.sdp;
+        console.log(answer.sdp);
         return pc.setRemoteDescription(answer);
     }).catch(function(e) {
         alert(e);
@@ -110,7 +94,8 @@ async function start() {
         };
         dc.onmessage = await function(evt) {
             console.log(evt.data)
-            dataChannelLog.textContent = '- num_face: ' + JSON.parse(evt.data).num_face + '\n';
+            data = JSON.parse(evt.data)
+            dataChannelLog.textContent = '- num_face: ' + data.num_face + ' ' + data.direction + '\n';
         };
     }
 
@@ -179,63 +164,6 @@ function stop() {
     setTimeout(function() {
         pc.close();
     }, 500);
-}
-
-function sdpFilterCodec(kind, codec, realSdp) {
-    var allowed = []
-    var rtxRegex = new RegExp('a=fmtp:(\\d+) apt=(\\d+)\r$');
-    var codecRegex = new RegExp('a=rtpmap:([0-9]+) ' + escapeRegExp(codec))
-    var videoRegex = new RegExp('(m=' + kind + ' .*?)( ([0-9]+))*\\s*$')
-
-    var lines = realSdp.split('\n');
-
-    var isKind = false;
-    for (var i = 0; i < lines.length; i++) {
-        if (lines[i].startsWith('m=' + kind + ' ')) {
-            isKind = true;
-        } else if (lines[i].startsWith('m=')) {
-            isKind = false;
-        }
-
-        if (isKind) {
-            var match = lines[i].match(codecRegex);
-            if (match) {
-                allowed.push(parseInt(match[1]));
-            }
-
-            match = lines[i].match(rtxRegex);
-            if (match && allowed.includes(parseInt(match[2]))) {
-                allowed.push(parseInt(match[1]));
-            }
-        }
-    }
-
-    var skipRegex = 'a=(fmtp|rtcp-fb|rtpmap):([0-9]+)';
-    var sdp = '';
-
-    isKind = false;
-    for (var i = 0; i < lines.length; i++) {
-        if (lines[i].startsWith('m=' + kind + ' ')) {
-            isKind = true;
-        } else if (lines[i].startsWith('m=')) {
-            isKind = false;
-        }
-
-        if (isKind) {
-            var skipMatch = lines[i].match(skipRegex);
-            if (skipMatch && !allowed.includes(parseInt(skipMatch[2]))) {
-                continue;
-            } else if (lines[i].match(videoRegex)) {
-                sdp += lines[i].replace(videoRegex, '$1 ' + allowed.join(' ')) + '\n';
-            } else {
-                sdp += lines[i] + '\n';
-            }
-        } else {
-            sdp += lines[i] + '\n';
-        }
-    }
-
-    return sdp;
 }
 
 function escapeRegExp(string) {

@@ -14,37 +14,23 @@ import mediapipe as mp
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaRelay
 
+from utils import validate
+
 ROOT = os.path.dirname(__file__)
 
 logger = logging.getLogger("pc")
 pcs = set()
 relay = MediaRelay()
 
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(max_num_faces=2,
-                                  min_detection_confidence=0.5,
-                                  min_tracking_confidence=0.5)
-
-mp_drawing = mp.solutions.drawing_utils
-drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1)
-
-
-def detect_img(image):
-    # Convert the color space from BGR to RGB
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    # To improve performance
-    image.flags.writeable = False
-    # Get the result
-    results = face_mesh.process(image)
-    # To improve performance
-    image.flags.writeable = True
-    return results
-
 
 class FaceLivelinessProcessor:
     def __init__(self):
         self.__tracks = {}
         self.channel = None
+        mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = mp_face_mesh.FaceMesh(max_num_faces=2,
+                                               min_detection_confidence=0.5,
+                                               min_tracking_confidence=0.5)
 
     def addTrack(self, track):
         if track not in self.__tracks:
@@ -60,20 +46,46 @@ class FaceLivelinessProcessor:
             if task is not None:
                 task.cancel()
         self.__tracks = {}
+        self.face_mesh.close()
+
+    def detect_img(self, image):
+        # Convert the color space from BGR to RGB
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        # To improve performance
+        image.flags.writeable = False
+        # Get the result
+        results = self.face_mesh.process(image)
+        # To improve performance
+        image.flags.writeable = True
+        return results
 
     async def consume(self, track):
         while True:
             try:
                 frame = await track.recv()
                 img = frame.to_ndarray(format="bgr24")
+                img_h, img_w, img_c = img.shape
 
-                results = detect_img(img)
+                results = self.detect_img(img)
 
                 if self.channel is not None:
-                    mess = {
-                        "num_face": len(results.multi_face_landmarks) if results.multi_face_landmarks else 0,
-                    }
-                    print(mess)
+                    if results.multi_face_landmarks:
+                        if len(results.multi_face_landmarks) == 1:
+                            box, direction, blink, smile = validate(results.multi_face_landmarks[0], img_h, img_w)
+                            mess = {
+                                "num_face": 1,
+                                "direction": direction,
+                                "blink": blink,
+                                "smile": smile,
+                                "box": box
+                            }
+                        else:
+                            mess = {
+                                "num_face": len(results.multi_face_landmarks),
+                            }
+                    else:
+                        mess = {"num_face": 0}
+                    # print(mess)
                     self.channel.send(json.dumps(mess))
                     await self.channel._RTCDataChannel__transport._data_channel_flush()
                     await self.channel._RTCDataChannel__transport._transmit()
@@ -98,13 +110,13 @@ async def offer(request):
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
     pc = RTCPeerConnection()
-    pc_id = "PeerConnection(%s)" % uuid.uuid4()
+    pc_id = f"PeerConnection({uuid.uuid4()})"
     pcs.add(pc)
 
     def log_info(msg, *args):
         logger.info(pc_id + " " + msg, *args)
 
-    log_info("Created for %s", request.remote)
+    log_info(f"Created for {request.remote}")
 
     # prepare local media
     processor = FaceLivelinessProcessor()
